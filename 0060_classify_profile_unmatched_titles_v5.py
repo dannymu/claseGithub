@@ -64,11 +64,40 @@ BIBLIO_TITLE_TERMS = [
 ]
 
 # Términos a buscar en el area_name de la taxonomía
-BIBLIO_AREA_TERMS = [
-    "bibliometr", "scientometr", "metascience",
-    "library", "information science", "research evaluation",
+BIBLIO_LABEL_TERMS = [
+    "bibliometr",
+    "scientometr",
+    "cienciometr",
     "informetr",
+    "metascience",
+    "research evaluation",
+    "scientific communication",
+    "scholarly communication",
+    "communication and information",
+    "information society",
 ]
+
+BIBLIO_TITLE_TERMS.extend([
+    "scholarly communication",
+    "scientific communication",
+    "comunicacion cientifica",
+    "comunicación científica",
+    "produccion cientifica",
+    "producción científica",
+    "scientific production",
+    "scientific output",
+    "research visibility",
+    "academic visibility",
+    "journal impact",
+    "journal citation",
+    "citation database",
+    "research performance",
+    "science mapping",
+    "open citations",
+    "data citation",
+    "data sharing",
+    "data reuse",
+])
 
 
 def has_biblio_signal(title: str) -> bool:
@@ -76,10 +105,9 @@ def has_biblio_signal(title: str) -> bool:
     return any(term in title_lower for term in BIBLIO_TITLE_TERMS)
 
 
-def is_biblio_area(area_name: str) -> bool:
-    area_lower = area_name.lower()
-    return any(term in area_lower for term in BIBLIO_AREA_TERMS)
-
+def is_biblio_label(area_name: str, subarea_name: str) -> bool:
+    text = f"{area_name} {subarea_name}".lower()
+    return any(term in text for term in BIBLIO_LABEL_TERMS)
 
 def rerank_biblio(order_i, sub_scores_i, groups, margin_threshold: float):
     """
@@ -93,18 +121,18 @@ def rerank_biblio(order_i, sub_scores_i, groups, margin_threshold: float):
     3. margen entre top1_score y biblio_score < margin_threshold
     """
     top1_gidx  = int(order_i[0])
-    top1_area  = groups[top1_gidx]["area_name"]
+    top1_area = groups[top1_gidx]["area_name"]
+    top1_subarea = groups[top1_gidx]["subarea_name"]
     top1_score = float(sub_scores_i[top1_gidx])
 
-    if is_biblio_area(top1_area):
-        # ya es bibliometría → no rerank
-        return order_i, None, None
+    if is_biblio_label(top1_area, top1_subarea):
+      return order_i, None, None
 
     # Buscar la primera aparición de bibliometría en top2..topK
     for rank_pos in range(1, len(order_i)):
         gidx  = int(order_i[rank_pos])
         g     = groups[gidx]
-        if is_biblio_area(g["area_name"]):
+        if is_biblio_label(g["area_name"], g["subarea_name"]):
             biblio_score = float(sub_scores_i[gidx])
             margin_top1_biblio = top1_score - biblio_score
             if margin_top1_biblio < margin_threshold:
@@ -358,8 +386,13 @@ for subarea_id, idx in tax_meta.groupby("subarea_id").groups.items():
 
 print(f"Reranking bibliométrico: {'ACTIVO' if args.rerank_bibliometrics else 'INACTIVO'}")
 if args.rerank_bibliometrics:
-    biblio_areas_in_tax = [g["area_name"] for g in groups if is_biblio_area(g["area_name"])]
-    print(f"  Áreas bibliométricas detectadas en taxonomía: {biblio_areas_in_tax}")
+    biblio_labels_in_tax = [
+    f"{g['area_name']} / {g['subarea_name']}"
+    for g in groups
+    if is_biblio_label(g["area_name"], g["subarea_name"])
+    ]
+
+    print(f"  Etiquetas bibliométricas detectadas en taxonomía: {biblio_labels_in_tax}")
     print(f"  Umbral de margen para reranking: {args.rerank_margin_threshold}")
 
 

@@ -437,10 +437,19 @@ summary_topk_qa
 # ==========================================================
 # PRUEBA DE PERFIL INDIVIDUAL
 # ==========================================================
-selected_profile_ <- "alberto"
-selected_profile_file_ <- "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/perfiles_research/gs-martin.csv"
-source("/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/21b_objetivo1_v5_2_evaluar_perfil_individual_fast.R")
+selected_profile_query <- "martin"
+
+selected_profile_file <- "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/perfiles_research/gs-martin.csv"
+
+source(
+  "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/21b_objetivo1_v5_2_evaluar_perfil_individual_fast.R"
+)
 # source("/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/21_objetivo1_v5_2_evaluar_perfil_individual.R")
+
+
+file.exists(
+  "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/tables/objetivo1_v5_2_profile_individual_evaluation_fast/martin/profile_publications_unmatched.csv"
+)
 
 summary_matching
 summary_match_method
@@ -452,4 +461,19 @@ head(summary_top1_area_all_matches, 30)
 summary_review_groups
 
 # ============================================================
-# source("/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/21a_objetivo1_v5_2_crear_indices_busqueda_final_qa.R")
+researcher_safe_id <- "martin"
+
+source(
+  "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/22b_objetivo1_v5_2_clasificar_no_encontrados_perfil_pipeline_oficial.R"
+)
+
+source(
+  "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN/script/22_objetivo1_v5_2_clasificar_no_encontrados_perfil_v2.R"
+)
+summary_profile_coverage
+summary_profile_output
+summary_area_unmatched
+summary_status_unmatched
+summary_metascience_unmatched
+summary_profile_accepted_area
+summary_profile_suggested_area

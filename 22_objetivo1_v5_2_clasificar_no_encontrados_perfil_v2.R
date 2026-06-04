@@ -46,17 +46,18 @@ profile_eval_dir <- file.path(
   researcher_safe_id
 )
 
-# Embeddings y metadata de taxonomía v4
+# Embeddings y metadata de taxonomía v4 (misma ruta que usa 22b y 03)
 tax_emb_file  <- file.path(
   base_dir,
   "embeddings",
-  "specter2_classification_taxonomy_v4",
-  "taxonomy_v4_embeddings.npy"
+  "specter2_taxonomy_v4_multiprototype",
+  "docs_embeddings.npy"
 )
 tax_meta_file <- file.path(
-  tables_dir,
-  "objetivo1_v5_2_taxonomy_v4",
-  "taxonomy_v4_meta.csv"
+  base_dir,
+  "embeddings",
+  "specter2_taxonomy_v4_multiprototype",
+  "docs_embeddings_meta_fixed.csv"
 )
 
 # Directorio de salida
