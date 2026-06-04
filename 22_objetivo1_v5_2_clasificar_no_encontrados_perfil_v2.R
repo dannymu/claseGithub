@@ -1,13 +1,27 @@
 # ============================================================
 # 22_objetivo1_v5_2_clasificar_no_encontrados_perfil_v2.R
 #
-# Clasificar publicaciones NO emparejadas de un perfil
-# usando título-solo + SPECTER2 classification + zero-shot.
+# Paso intermedio entre 21b y 0054:
+# Clasifica las publicaciones del perfil que NO fueron encontradas
+# en el corpus principal (profile_publications_unmatched.csv),
+# usando SPECTER2 + zero-shot v4 sobre el título solamente.
 #
-# Regla metodológica:
-# - No produce clasificación final.
-# - Produce sugerencias title-only.
-# - Todo resultado requiere revisión.
+# Novedades v2:
+# - Usa 0060_classify_profile_unmatched_titles_v5.py (reranking bibliométrico)
+# - Post-proceso de reranking bibliométrico también sobre publicaciones
+#   MATCHEADAS del corpus (corrección de casos NLP/Data Science → Bibliometrics)
+# - Reporte detallado de casos rerrankeados
+# - Generación de combined_profile_all_publications.csv con columna
+#   classification_origin para 0054
+#
+# Prerequisitos:
+#   - Haber ejecutado 21b (genera profile_publications_unmatched.csv)
+#   - Tener disponibles los embeddings de taxonomía v4
+#   - Python con: transformers, adapters, numpy, pandas, scikit-learn, tqdm
+#
+# Uso:
+#   researcher_safe_id <- "martin_alberto"
+#   source("22_objetivo1_v5_2_clasificar_no_encontrados_perfil_v2.R")
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -15,915 +29,353 @@ suppressPackageStartupMessages({
   library(stringi)
 })
 
-# ============================================================
-# 1) Configuración
-# ============================================================
-
-base_dir <- "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN"
+base_dir   <- "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN"
 tables_dir <- file.path(base_dir, "tables")
 script_dir <- file.path(base_dir, "script")
 
-# Cambia este valor para otro perfil.
-# Para Alberto Martín-Martín:
+# ── parámetros ────────────────────────────────────────────────
+
 if (!exists("researcher_safe_id") || is.null(researcher_safe_id)) {
-  researcher_safe_id <- "alberto_martin_martin"
+  stop("Define researcher_safe_id antes de ejecutar este script.")
 }
 
+# Directorio de salida del script 21b
 profile_eval_dir <- file.path(
   tables_dir,
   "objetivo1_v5_2_profile_individual_evaluation_fast",
   researcher_safe_id
 )
 
-unmatched_csv <- file.path(
-  profile_eval_dir,
-  "profile_publications_unmatched.csv"
-)
-
-matched_csv <- file.path(
-  profile_eval_dir,
-  "profile_publications_matched_final_qa.csv"
-)
-
-# Rutas reales usadas en el pipeline v4/v5.2
-tax_emb_file <- file.path(
+# Embeddings y metadata de taxonomía v4
+tax_emb_file  <- file.path(
   base_dir,
   "embeddings",
-  "specter2_taxonomy_v4_multiprototype",
-  "docs_embeddings.npy"
+  "specter2_classification_taxonomy_v4",
+  "taxonomy_v4_embeddings.npy"
 )
-
 tax_meta_file <- file.path(
-  base_dir,
-  "embeddings",
-  "specter2_taxonomy_v4_multiprototype",
-  "docs_embeddings_meta_fixed.csv"
+  tables_dir,
+  "objetivo1_v5_2_taxonomy_v4",
+  "taxonomy_v4_meta.csv"
 )
 
-python_bin <- path.expand("~/env_cluster/bin/python")
-
-python_script <- file.path(
-  script_dir,
-  "0060_classify_profile_unmatched_titles_v3.py"
-)
-
+# Directorio de salida
 unmatched_out_dir <- file.path(
   tables_dir,
-  "objetivo1_v5_2_profile_unmatched_classified_v2",
+  "objetivo1_v5_2_profile_unmatched_classified",
   researcher_safe_id
 )
 
-dir.create(unmatched_out_dir, recursive = TRUE, showWarnings = FALSE)
+# Python y script
+python_bin    <- path.expand("~/env_cluster/bin/python")
+python_script <- file.path(script_dir, "0060_classify_profile_unmatched_titles_v5.py")
 
-# Parámetros title-only
-top_k <- 5
-min_score <- 0.30
-min_margin <- 0.02
-batch_size <- 32
-overwrite <- TRUE
+# Umbral de reranking bibliométrico (igual que v5 Python)
+rerank_margin_threshold <- 0.05
 
-# ============================================================
-# 2) Funciones
-# ============================================================
+# ── términos bibliométricos para reranking en R ───────────────
 
-clean_text <- function(x) {
-  x <- as.character(x)
-  x[is.na(x)] <- ""
-  x <- enc2utf8(x)
-  x <- gsub("[\r\n\t]+", " ", x)
-  x <- gsub("[[:space:]]+", " ", x)
-  trimws(x)
-}
-
-safe_numeric <- function(x) suppressWarnings(as.numeric(x))
-
-contains_biblio_topk <- function(dt) {
-  out <- rep(FALSE, nrow(dt))
-  
-  for (k in 1:5) {
-    area_col <- paste0("top", k, "_area_name")
-    sub_col <- paste0("top", k, "_subarea_name")
-    
-    if (area_col %in% names(dt) && sub_col %in% names(dt)) {
-      out <- out |
-        clean_text(dt[[area_col]]) == "Social Sciences" &
-        clean_text(dt[[sub_col]]) == "Bibliometrics and Scientometrics"
-    }
-  }
-  
-  out
-}
-
-is_biblio_top1 <- function(dt) {
-  if (!all(c("top1_area_name", "top1_subarea_name") %in% names(dt))) {
-    return(rep(FALSE, nrow(dt)))
-  }
-  
-  clean_text(dt$top1_area_name) == "Social Sciences" &
-    clean_text(dt$top1_subarea_name) == "Bibliometrics and Scientometrics"
-}
-
-has_metascience_terms <- function(x) {
-  pattern <- paste(
-    c(
-      "bibliometric",
-      "bibliometr",
-      "scientometric",
-      "cienciometr",
-      "informetric",
-      "altmetric",
-      "altm[eé]tric",
-      "citation analysis",
-      "citation impact",
-      "citation index",
-      "citation count",
-      "co-citation",
-      "cocitation",
-      "co-word",
-      "h-index",
-      "\\bindice h\\b",
-      "google scholar",
-      "google scholar metrics",
-      "web of science",
-      "scopus",
-      "journal citation reports",
-      "impact factor",
-      "factor de impacto",
-      "journal ranking",
-      "ranking de revistas",
-      "research evaluation",
-      "research assessment",
-      "evaluaci[oó]n cient[ií]fica",
-      "producci[oó]n cient[ií]fica",
-      "scientific production",
-      "scientific output",
-      "scholarly communication",
-      "comunicaci[oó]n cient[ií]fica",
-      "science mapping",
-      "mapas? de ciencia",
-      "data citation",
-      "data sharing",
-      "data reuse",
-      "research data",
-      "open science",
-      "ciencia abierta",
-      "open access",
-      "acceso abierto",
-      "repositories",
-      "repositorios",
-      "academic profile",
-      "academic search engine",
-      "research visibility",
-      "visibilidad cient[ií]fica",
-      "orcid",
-      "doi",
-      "crossref",
-      "openalex",
-      "semantic scholar",
-      "mendeley",
-      "plumx"
-    ),
-    collapse = "|"
-  )
-  
-  grepl(pattern, clean_text(x), ignore.case = TRUE, perl = TRUE)
-}
-
-make_top5_text <- function(dt) {
-  paste(
-    paste0("1) ", clean_text(dt$candidate_top1)),
-    paste0("2) ", clean_text(dt$candidate_top2)),
-    paste0("3) ", clean_text(dt$candidate_top3)),
-    paste0("4) ", clean_text(dt$candidate_top4)),
-    paste0("5) ", clean_text(dt$candidate_top5)),
-    sep = "\n"
-  )
-}
-
-# ============================================================
-# 3) Validaciones
-# ============================================================
-
-cat("\n================ CLASIFICACIÓN TITLE-ONLY NO EMPAREJADOS ================\n")
-cat("Perfil:", researcher_safe_id, "\n")
-cat("Directorio perfil:", profile_eval_dir, "\n")
-
-required_files <- c(
-  unmatched_csv,
-  tax_emb_file,
-  tax_meta_file,
-  python_bin,
-  python_script
+biblio_title_terms <- c(
+  "bibliometr", "scientometr", "metascience", "informetr",
+  "webometr", "altmetr", "technomet",
+  "h-index", "h index", "impact factor", "citation",
+  "journal ranking", "journal metric", "research metric",
+  "scholar metric", "academic metric", "publication metric",
+  "google scholar", "web of science", "scopus", "pubmed",
+  "academic search", "academic database", "research database",
+  "semantic scholar", "dimensions data",
+  "research evaluation", "research assessment",
+  "academic ranking", "university ranking",
+  "research output", "scientific output",
+  "research impact", "academic impact",
+  "open access", "open science",
+  "institutional repository", "research profile",
+  "impactstory", "orcid", "citation analysis", "citation network",
+  "co-citation", "bibliographic coupling",
+  "publication trend"
 )
 
-missing_files <- required_files[!file.exists(required_files)]
+biblio_area_terms <- c(
+  "bibliometr", "scientometr", "metascience",
+  "library", "information science", "research evaluation", "informetr"
+)
 
-if (length(missing_files) > 0) {
+has_biblio_signal <- function(title) {
+  tl <- tolower(title)
+  any(vapply(biblio_title_terms, function(t) grepl(t, tl, fixed = TRUE), logical(1)))
+}
+
+is_biblio_area <- function(area_name) {
+  al <- tolower(as.character(area_name))
+  any(vapply(biblio_area_terms, function(t) grepl(t, al, fixed = TRUE), logical(1)))
+}
+
+# Vectorized version for data.table column operations
+is_biblio_area_vec <- function(area_vec) {
+  vapply(area_vec, function(x) {
+    if (is.na(x) || x == "") return(FALSE)
+    is_biblio_area(x)
+  }, logical(1))
+}
+
+# ── validar inputs ────────────────────────────────────────────
+
+unmatched_csv <- file.path(profile_eval_dir, "profile_publications_unmatched.csv")
+
+if (!file.exists(unmatched_csv)) {
   stop(
-    "Faltan archivos requeridos:\n",
-    paste(missing_files, collapse = "\n")
+    "No se encontró profile_publications_unmatched.csv en:\n  ", profile_eval_dir,
+    "\n\nEjecuta primero 21b con researcher_safe_id = '", researcher_safe_id, "'"
   )
 }
 
 unmatched_check <- fread(unmatched_csv)
-setDT(unmatched_check)
-
-cat("Publicaciones no emparejadas:", nrow(unmatched_check), "\n")
 
 if (nrow(unmatched_check) == 0) {
-  cat("No hay publicaciones no emparejadas. Nada que clasificar.\n")
-  quit(save = "no")
-}
-
-if (!"profile_title" %in% names(unmatched_check)) {
-  stop("El archivo unmatched no contiene profile_title.")
-}
-
-empty_title_pct <- round(
-  mean(clean_text(unmatched_check$profile_title) == "") * 100,
-  2
-)
-
-cat("Porcentaje de títulos vacíos:", empty_title_pct, "%\n")
-
-# ============================================================
-# 4) Ejecutar Python
-# ============================================================
-
-py_args <- c(
-  python_script,
-  "--unmatched_csv", unmatched_csv,
-  "--tax_emb", tax_emb_file,
-  "--tax_meta", tax_meta_file,
-  "--output_dir", unmatched_out_dir,
-  "--top_k", as.character(top_k),
-  "--min_score", as.character(min_score),
-  "--min_margin", as.character(min_margin),
-  "--batch_size", as.character(batch_size)
-)
-
-if (overwrite) {
-  py_args <- c(py_args, "--overwrite")
-}
-
-cat("\nEjecutando Python title-only...\n")
-cat("Salida:", unmatched_out_dir, "\n")
-
-t0 <- proc.time()
-
-ret <- system2(
-  command = python_bin,
-  args = py_args,
-  stdout = TRUE,
-  stderr = TRUE
-)
-
-elapsed <- proc.time() - t0
-
-cat(paste(ret, collapse = "\n"), "\n")
-cat(sprintf("\nTiempo transcurrido: %.1f segundos\n", elapsed["elapsed"]))
-
-status <- attr(ret, "status")
-if (!is.null(status) && status != 0) {
-  stop("Falló la clasificación Python title-only.")
-}
-
-pred_file <- file.path(
-  unmatched_out_dir,
-  "unmatched_zero_shot_title_only_suggestions.csv"
-)
-
-if (!file.exists(pred_file)) {
-  stop("No se generó el archivo esperado: ", pred_file)
-}
-
-unmatched_classified <- fread(pred_file)
-setDT(unmatched_classified)
-
-# ============================================================
-# 5) Enriquecer salida title-only con QA y metaciencia
-# ============================================================
-
-unmatched_classified[, profile_title := clean_text(profile_title)]
-
-unmatched_classified[
-  ,
-  title_only_has_metascience_terms := has_metascience_terms(profile_title)
-]
-
-unmatched_classified[
-  ,
-  title_only_top1_is_bibliometrics := is_biblio_top1(.SD)
-]
-
-unmatched_classified[
-  ,
-  title_only_top5_contains_bibliometrics := contains_biblio_topk(.SD)
-]
-
-unmatched_classified[
-  ,
-  title_only_possible_metascience_conflict :=
-    title_only_has_metascience_terms == TRUE &
-    title_only_top1_is_bibliometrics == FALSE
-]
-
-unmatched_classified[
-  ,
-  title_only_possible_metascience_top5_failure :=
-    title_only_has_metascience_terms == TRUE &
-    title_only_top1_is_bibliometrics == FALSE &
-    title_only_top5_contains_bibliometrics == FALSE
-]
-
-unmatched_classified[
-  ,
-  title_only_possible_metascience_rerank_case :=
-    title_only_has_metascience_terms == TRUE &
-    title_only_top1_is_bibliometrics == FALSE &
-    title_only_top5_contains_bibliometrics == TRUE
-]
-
-# Reglas de salida:
-# Nunca aceptar automáticamente title-only.
-unmatched_classified[, qa_auto_accept := FALSE]
-unmatched_classified[, qa_requires_review := TRUE]
-unmatched_classified[, qa_final_decision := "requires_review_title_only_zero_shot"]
-unmatched_classified[, qa_final_confidence_tier := "exploratory_title_only"]
-unmatched_classified[, needs_profile_review := TRUE]
-
-unmatched_classified[
-  title_only_possible_metascience_conflict == TRUE,
-  qa_final_decision := "requires_review_title_only_metascience_conflict"
-]
-
-unmatched_classified[
-  title_only_possible_metascience_conflict == TRUE,
-  qa_final_confidence_tier := "exploratory_title_only_metascience_review"
-]
-
-unmatched_classified[
-  ,
-  suggested_area_title_only := clean_text(top1_area_name)
-]
-
-unmatched_classified[
-  ,
-  suggested_subarea_title_only := clean_text(top1_subarea_name)
-]
-
-unmatched_classified[
-  ,
-  suggested_label_title_only := paste(
-    suggested_area_title_only,
-    suggested_subarea_title_only,
-    sep = " / "
-  )
-]
-
-unmatched_classified[
-  ,
-  title_only_evidence_level := fcase(
-    
-    zero_shot_status == "low_similarity_review",
-    "titulo_solo_baja_similitud_revision",
-    
-    zero_shot_status == "ambiguous_review",
-    "titulo_solo_ambiguo_revision",
-    
-    title_only_possible_metascience_conflict == TRUE,
-    "titulo_solo_metaciencia_revision_prioritaria",
-    
-    confidence_level == "alta_confianza_title_only",
-    "titulo_solo_sugerencia_alta_senal",
-    
-    confidence_level == "confianza_media_title_only",
-    "titulo_solo_sugerencia_media_senal",
-    
-    default = "titulo_solo_sugerencia_revision"
-  )
-]
-
-unmatched_classified[
-  ,
-  review_reason := fcase(
-    
-    title_only_possible_metascience_top5_failure == TRUE,
-    "title_only_no_corpus_match; possible_metascience_bibliometrics_top5_failure",
-    
-    title_only_possible_metascience_rerank_case == TRUE,
-    "title_only_no_corpus_match; possible_metascience_bibliometrics_rerank_case",
-    
-    title_only_possible_metascience_conflict == TRUE,
-    "title_only_no_corpus_match; possible_metascience_bibliometrics_conflict",
-    
-    default = "title_only_no_corpus_match; exploratory_zero_shot_suggestion"
-  )
-]
-
-# No crear final_area_label ni final_subarea_label.
-# Si vinieran del Python por alguna razón, se eliminan o vacían.
-if ("final_area_label" %in% names(unmatched_classified)) {
-  unmatched_classified[, final_area_label := NA_character_]
-}
-
-if ("final_subarea_label" %in% names(unmatched_classified)) {
-  unmatched_classified[, final_subarea_label := NA_character_]
-}
-
-# ============================================================
-# 6) Resúmenes title-only
-# ============================================================
-
-summary_area_unmatched <- unmatched_classified[
-  ,
-  .(
-    publications = .N,
-    citations = sum(profile_cites, na.rm = TRUE),
-    mean_score = round(mean(top1_score, na.rm = TRUE), 4),
-    mean_margin = round(mean(top1_top2_margin, na.rm = TRUE), 4),
-    review_required = sum(qa_requires_review == TRUE, na.rm = TRUE),
-    metascience_conflict = sum(title_only_possible_metascience_conflict == TRUE, na.rm = TRUE)
-  ),
-  by = .(
-    suggested_area_title_only,
-    suggested_subarea_title_only
-  )
-][order(-publications)]
-
-summary_area_unmatched[
-  ,
-  pct := round(publications / sum(publications) * 100, 2)
-]
-
-summary_status_unmatched <- unmatched_classified[
-  ,
-  .N,
-  by = .(
-    zero_shot_status,
-    confidence_level,
-    title_only_evidence_level
-  )
-][order(-N)]
-
-summary_metascience_unmatched <- data.table(
-  metric = c(
-    "title_only_total",
-    "title_only_has_metascience_terms",
-    "title_only_top1_is_bibliometrics",
-    "title_only_top5_contains_bibliometrics",
-    "title_only_possible_metascience_conflict",
-    "title_only_possible_metascience_top5_failure",
-    "title_only_possible_metascience_rerank_case"
-  ),
-  value = c(
-    nrow(unmatched_classified),
-    unmatched_classified[title_only_has_metascience_terms == TRUE, .N],
-    unmatched_classified[title_only_top1_is_bibliometrics == TRUE, .N],
-    unmatched_classified[title_only_top5_contains_bibliometrics == TRUE, .N],
-    unmatched_classified[title_only_possible_metascience_conflict == TRUE, .N],
-    unmatched_classified[title_only_possible_metascience_top5_failure == TRUE, .N],
-    unmatched_classified[title_only_possible_metascience_rerank_case == TRUE, .N]
-  )
-)
-
-summary_metascience_unmatched[
-  ,
-  pct := round(value / nrow(unmatched_classified) * 100, 2)
-]
-
-# ============================================================
-# 7) Combinar con emparejadas del perfil
-# ============================================================
-
-matched_dt <- if (file.exists(matched_csv)) {
-  fread(matched_csv)
+  cat("\nNo hay publicaciones sin match para '", researcher_safe_id, "'. Nada que clasificar.\n", sep = "")
+  unmatched_classified <- data.table()
 } else {
-  data.table()
-}
 
-if (nrow(matched_dt) > 0) {
-  setDT(matched_dt)
-  
-  matched_dt[
-    ,
-    profile_classification_origin := "matched_in_universe_v5_2_qa"
-  ]
-  
-  matched_dt[
-    ,
-    profile_output_type := fifelse(
-      qa_auto_accept == TRUE,
-      "accepted_from_corpus_qa",
-      "review_required_from_corpus_qa"
-    )
-  ]
-  
-  matched_dt[
-    ,
-    profile_accepted_area_label := fifelse(
-      qa_auto_accept == TRUE,
-      qa_final_area_label,
-      NA_character_
-    )
-  ]
-  
-  matched_dt[
-    ,
-    profile_accepted_subarea_label := fifelse(
-      qa_auto_accept == TRUE,
-      qa_final_subarea_label,
-      NA_character_
-    )
-  ]
-  
-  matched_dt[
-    ,
-    profile_suggested_area_label := top1_area_name
-  ]
-  
-  matched_dt[
-    ,
-    profile_suggested_subarea_label := top1_subarea_name
-  ]
-  
-  matched_dt[
-    ,
-    profile_requires_review := qa_requires_review
-  ]
-}
+  cat("\nPublicaciones sin match a clasificar:", nrow(unmatched_check), "\n")
+  cat("Porcentaje título vacío:",
+      round(mean(unmatched_check$profile_title == "" | is.na(unmatched_check$profile_title)) * 100, 1), "%\n")
 
-if (nrow(unmatched_classified) > 0) {
-  
-  unmatched_profile <- copy(unmatched_classified)
-  
-  unmatched_profile[
-    ,
-    profile_classification_origin := "profile_unmatched_title_only_suggestion"
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_output_type := "review_required_title_only_suggestion"
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_accepted_area_label := NA_character_
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_accepted_subarea_label := NA_character_
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_suggested_area_label := suggested_area_title_only
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_suggested_subarea_label := suggested_subarea_title_only
-  ]
-  
-  unmatched_profile[
-    ,
-    profile_requires_review := TRUE
-  ]
-  
-} else {
-  unmatched_profile <- data.table()
-}
-
-common_profile_cols <- c(
-  "profile_row_id",
-  "researcher_name",
-  "researcher_safe_id",
-  "profile_file",
-  "profile_title",
-  "profile_year",
-  "profile_cites",
-  "profile_doi",
-  "profile_source",
-  "profile_classification_origin",
-  "profile_output_type",
-  "profile_accepted_area_label",
-  "profile_accepted_subarea_label",
-  "profile_suggested_area_label",
-  "profile_suggested_subarea_label",
-  "profile_requires_review",
-  "qa_final_decision",
-  "qa_final_confidence_tier",
-  "qa_auto_accept",
-  "qa_requires_review",
-  "top1_area_name",
-  "top1_subarea_name",
-  "top1_score",
-  "top2_area_name",
-  "top2_subarea_name",
-  "top2_score",
-  "top1_top2_margin",
-  "candidate_top1",
-  "candidate_top2",
-  "candidate_top3",
-  "candidate_top4",
-  "candidate_top5",
-  "zero_shot_status",
-  "confidence_level",
-  "review_reason",
-  "title_only_evidence_level",
-  "title_only_possible_metascience_conflict"
-)
-
-for (col in common_profile_cols) {
-  if (nrow(matched_dt) > 0 && !col %in% names(matched_dt)) matched_dt[, (col) := NA]
-  if (nrow(unmatched_profile) > 0 && !col %in% names(unmatched_profile)) unmatched_profile[, (col) := NA]
-}
-
-profile_combined <- rbindlist(
-  list(
-    if (nrow(matched_dt) > 0) matched_dt[, ..common_profile_cols] else NULL,
-    if (nrow(unmatched_profile) > 0) unmatched_profile[, ..common_profile_cols] else NULL
-  ),
-  fill = TRUE
-)
-
-# ============================================================
-# 8) Resúmenes combinados
-# ============================================================
-
-summary_profile_coverage <- data.table(
-  metric = c(
-    "matched_in_corpus",
-    "unmatched_title_only_suggestions",
-    "profile_total_covered",
-    "pct_matched_in_corpus",
-    "pct_title_only_suggestions"
-  ),
-  value = c(
-    nrow(matched_dt),
-    nrow(unmatched_profile),
-    nrow(profile_combined),
-    round(nrow(matched_dt) / nrow(profile_combined) * 100, 2),
-    round(nrow(unmatched_profile) / nrow(profile_combined) * 100, 2)
-  )
-)
-
-summary_profile_output <- profile_combined[
-  ,
-  .N,
-  by = .(
-    profile_classification_origin,
-    profile_output_type,
-    profile_requires_review
-  )
-][order(-N)]
-
-summary_profile_suggested_area <- profile_combined[
-  ,
-  .(
-    publications = .N,
-    citations = sum(profile_cites, na.rm = TRUE),
-    accepted = sum(!is.na(profile_accepted_area_label) & profile_accepted_area_label != "", na.rm = TRUE),
-    review_required = sum(profile_requires_review == TRUE, na.rm = TRUE)
-  ),
-  by = .(
-    profile_suggested_area_label,
-    profile_suggested_subarea_label
-  )
-][order(-publications)]
-
-summary_profile_accepted_area <- profile_combined[
-  !is.na(profile_accepted_area_label) &
-    profile_accepted_area_label != "",
-  .(
-    publications = .N,
-    citations = sum(profile_cites, na.rm = TRUE)
-  ),
-  by = .(
-    profile_accepted_area_label,
-    profile_accepted_subarea_label
-  )
-][order(-publications)]
-
-# ============================================================
-# 9) Muestra de revisión manual
-# ============================================================
-
-review_dt <- copy(profile_combined)
-
-review_dt[
-  ,
-  candidate_top5_text := paste(
-    paste0("1) ", clean_text(candidate_top1)),
-    paste0("2) ", clean_text(candidate_top2)),
-    paste0("3) ", clean_text(candidate_top3)),
-    paste0("4) ", clean_text(candidate_top4)),
-    paste0("5) ", clean_text(candidate_top5)),
-    sep = "\n"
-  )
-]
-
-review_dt[
-  ,
-  text_for_review_short := paste(
-    paste0("Título: ", profile_title),
-    paste0("Año: ", profile_year),
-    paste0("Fuente: ", profile_source),
-    paste0("Origen: ", profile_classification_origin),
-    paste0("Tipo salida: ", profile_output_type),
-    paste0("Área aceptada: ", profile_accepted_area_label),
-    paste0("Subárea aceptada: ", profile_accepted_subarea_label),
-    paste0("Sugerencia top1: ", profile_suggested_area_label, " / ", profile_suggested_subarea_label),
-    paste0("Top-k:\n", candidate_top5_text),
-    sep = "\n\n"
-  )
-]
-
-review_dt[, manual_area_correct := ""]
-review_dt[, manual_subarea_correct := ""]
-review_dt[, manual_area_label := ""]
-review_dt[, manual_subarea_label := ""]
-review_dt[, manual_decision := ""]
-review_dt[, manual_comment := ""]
-
-review_cols <- c(
-  "profile_row_id",
-  "profile_title",
-  "profile_year",
-  "profile_cites",
-  "profile_source",
-  "profile_classification_origin",
-  "profile_output_type",
-  "profile_accepted_area_label",
-  "profile_accepted_subarea_label",
-  "profile_suggested_area_label",
-  "profile_suggested_subarea_label",
-  "profile_requires_review",
-  "qa_final_decision",
-  "qa_final_confidence_tier",
-  "top1_score",
-  "top1_top2_margin",
-  "candidate_top1",
-  "candidate_top2",
-  "candidate_top3",
-  "candidate_top4",
-  "candidate_top5",
-  "zero_shot_status",
-  "confidence_level",
-  "review_reason",
-  "title_only_evidence_level",
-  "title_only_possible_metascience_conflict",
-  "text_for_review_short",
-  "manual_area_correct",
-  "manual_subarea_correct",
-  "manual_area_label",
-  "manual_subarea_label",
-  "manual_decision",
-  "manual_comment"
-)
-
-for (col in review_cols) {
-  if (!col %in% names(review_dt)) review_dt[, (col) := NA]
-}
-
-review_dt <- review_dt[, ..review_cols]
-
-# ============================================================
-# 10) Exportar
-# ============================================================
-
-fwrite(
-  unmatched_classified,
-  file.path(unmatched_out_dir, "unmatched_title_only_suggestions_enriched.csv")
-)
-
-fwrite(
-  profile_combined,
-  file.path(unmatched_out_dir, "profile_combined_matched_plus_title_only_suggestions.csv")
-)
-
-fwrite(
-  review_dt,
-  file.path(unmatched_out_dir, "profile_review_all_matched_and_title_only.csv")
-)
-
-fwrite(
-  summary_area_unmatched,
-  file.path(unmatched_out_dir, "summary_area_unmatched_title_only.csv")
-)
-
-fwrite(
-  summary_status_unmatched,
-  file.path(unmatched_out_dir, "summary_status_unmatched_title_only.csv")
-)
-
-fwrite(
-  summary_metascience_unmatched,
-  file.path(unmatched_out_dir, "summary_metascience_unmatched_title_only.csv")
-)
-
-fwrite(
-  summary_profile_coverage,
-  file.path(unmatched_out_dir, "summary_profile_coverage_v2.csv")
-)
-
-fwrite(
-  summary_profile_output,
-  file.path(unmatched_out_dir, "summary_profile_output_v2.csv")
-)
-
-fwrite(
-  summary_profile_suggested_area,
-  file.path(unmatched_out_dir, "summary_profile_suggested_area_v2.csv")
-)
-
-fwrite(
-  summary_profile_accepted_area,
-  file.path(unmatched_out_dir, "summary_profile_accepted_area_v2.csv")
-)
-
-# XLSX de revisión
-if (requireNamespace("openxlsx", quietly = TRUE)) {
-  
-  xlsx_file <- file.path(
-    unmatched_out_dir,
-    "profile_review_all_matched_and_title_only.xlsx"
-  )
-  
-  wb <- openxlsx::createWorkbook()
-  
-  openxlsx::addWorksheet(wb, "revision")
-  openxlsx::addWorksheet(wb, "cobertura")
-  openxlsx::addWorksheet(wb, "sugeridas_title_only")
-  openxlsx::addWorksheet(wb, "aceptadas_corpus")
-  openxlsx::addWorksheet(wb, "metascience_title_only")
-  openxlsx::addWorksheet(wb, "instrucciones")
-  
-  openxlsx::writeData(wb, "revision", review_dt)
-  openxlsx::writeData(wb, "cobertura", summary_profile_coverage)
-  openxlsx::writeData(wb, "sugeridas_title_only", summary_area_unmatched)
-  openxlsx::writeData(wb, "aceptadas_corpus", summary_profile_accepted_area)
-  openxlsx::writeData(wb, "metascience_title_only", summary_metascience_unmatched)
-  
-  instrucciones <- data.table(
-    campo = c(
-      "manual_area_correct",
-      "manual_subarea_correct",
-      "manual_area_label",
-      "manual_subarea_label",
-      "manual_decision",
-      "manual_comment"
-    ),
-    instruccion = c(
-      "TRUE si el área aceptada o sugerida es correcta; FALSE si no.",
-      "TRUE si la subárea aceptada o sugerida es correcta; FALSE si no.",
-      "Si es incorrecta, escribir el área correcta.",
-      "Si es incorrecta, escribir la subárea correcta.",
-      "Usar: correct, area_correct_subarea_wrong, area_wrong, insufficient_information, ambiguous_or_both_valid, top5_contains_correct_label, top5_does_not_contain_correct_label.",
-      "Comentario breve. En title-only recordar que es sugerencia exploratoria."
-    )
-  )
-  
-  openxlsx::writeData(wb, "instrucciones", instrucciones)
-  openxlsx::freezePane(wb, "revision", firstActiveRow = 2, firstActiveCol = 4)
-  openxlsx::setColWidths(wb, "revision", cols = 1:ncol(review_dt), widths = "auto")
-  
-  text_col <- which(names(review_dt) == "text_for_review_short")
-  if (length(text_col) > 0) {
-    openxlsx::setColWidths(wb, "revision", cols = text_col, widths = 90)
+  for (f in c(tax_emb_file, tax_meta_file, python_script)) {
+    if (!file.exists(f)) stop("No se encontró:\n  ", f)
   }
-  
-  openxlsx::saveWorkbook(wb, xlsx_file, overwrite = TRUE)
+
+  dir.create(unmatched_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # ── llamar al script Python v5 ──────────────────────────────
+
+  cat("\nEjecutando clasificación SPECTER2 zero-shot v4 + reranking bibliométrico...\n")
+  cat("Salida en:", unmatched_out_dir, "\n\n")
+
+  py_args <- c(
+    python_script,
+    "--unmatched_csv",          shQuote(unmatched_csv),
+    "--tax_emb",                shQuote(tax_emb_file),
+    "--tax_meta",               shQuote(tax_meta_file),
+    "--output_dir",             shQuote(unmatched_out_dir),
+    "--rerank_bibliometrics",
+    "--rerank_margin_threshold", rerank_margin_threshold,
+    "--overwrite"
+  )
+
+  t0 <- proc.time()
+  ret <- system2(command = python_bin, args = py_args, stdout = TRUE, stderr = TRUE)
+  elapsed <- proc.time() - t0
+
+  cat(paste(ret, collapse = "\n"), "\n")
+  cat(sprintf("\nTiempo transcurrido: %.1f segundos\n", elapsed["elapsed"]))
+
+  # ── leer resultados ─────────────────────────────────────────
+
+  pred_file <- file.path(unmatched_out_dir, "unmatched_zero_shot_title_only_suggestions.csv")
+
+  if (!file.exists(pred_file)) {
+    stop("El script Python no generó el archivo esperado:\n  ", pred_file)
+  }
+
+  unmatched_classified <- fread(pred_file)
+
+  cat("\n================ CLASIFICACIÓN TÍTULOS SIN MATCH ================\n")
+  cat("Publicaciones clasificadas:", nrow(unmatched_classified), "\n")
+
+  if ("top1_area_name" %in% names(unmatched_classified)) {
+    summary_area_unmatched <- unmatched_classified[, .N, by = top1_area_name][order(-N)]
+    summary_area_unmatched[, pct := round(N / sum(N) * 100, 2)]
+    cat("\nDistribución de áreas (título-solo, post-reranking):\n")
+    print(summary_area_unmatched)
+  }
+
+  if ("reranked_to_bibliometrics" %in% names(unmatched_classified)) {
+    n_reranked <- sum(unmatched_classified$reranked_to_bibliometrics == TRUE, na.rm = TRUE)
+    cat("\nCasos rerrankeados a Bibliometrics:", n_reranked, "\n")
+    if (n_reranked > 0) {
+      reranked_dt <- unmatched_classified[reranked_to_bibliometrics == TRUE,
+                                          .(profile_title, orig_top1_area_before_rerank,
+                                            top1_area_name, top1_score, top1_top2_margin)]
+      print(reranked_dt)
+    }
+  }
+
+  if ("confidence_level" %in% names(unmatched_classified)) {
+    cat("\nConfianza:\n")
+    print(unmatched_classified[, .N, by = confidence_level][order(-N)])
+  }
+
+  # Guardar resúmenes
+  if (exists("summary_area_unmatched")) {
+    fwrite(summary_area_unmatched,
+           file.path(unmatched_out_dir, "summary_area_unmatched.csv"))
+  }
 }
 
-# ============================================================
-# 11) Imprimir
-# ============================================================
+# ── reranking bibliométrico para publicaciones MATCHEADAS ─────
 
-cat("\n================ RESULTADOS TITLE-ONLY v2 ================\n")
+cat("\n================ POST-PROCESO RERANKING MATCHEADAS ================\n")
 
-cat("\nCobertura perfil:\n")
-print(summary_profile_coverage)
+matched_file <- file.path(profile_eval_dir, "profile_publications_matched_final_qa.csv")
 
-cat("\nSalida por tipo:\n")
-print(summary_profile_output)
+if (!file.exists(matched_file)) {
+  cat("AVISO: No se encontró profile_publications_matched_final_qa.csv\n")
+  cat("Solo se tienen las publicaciones clasificadas por título.\n")
+  matched_reranked <- data.table()
+} else {
+  matched_dt <- fread(matched_file)
+  cat("Publicaciones matcheadas leídas:", nrow(matched_dt), "\n")
 
-cat("\nÁreas sugeridas para no emparejados title-only:\n")
-print(summary_area_unmatched)
+  # Detectar qué columna tiene el área asignada
+  area_col <- if ("qa_final_area_label" %in% names(matched_dt)) "qa_final_area_label" else
+              if ("top1_area_name" %in% names(matched_dt)) "top1_area_name" else NA_character_
 
-cat("\nEstado/confianza title-only:\n")
-print(summary_status_unmatched)
+  if (is.na(area_col)) {
+    cat("AVISO: No se encontró columna de área en matched_dt. Saltando reranking.\n")
+    matched_reranked <- matched_dt
+  } else {
 
-cat("\nMetaciencia/bibliometría title-only:\n")
-print(summary_metascience_unmatched)
+    # Condiciones para reranking:
+    # 1. Área actual NO es bibliométrica
+    # 2. El título tiene señal bibliométrica
+    # 3. top2_area_name (si existe) es bibliométrica o está en top2-5
+    matched_dt[, biblio_signal_in_title := vapply(
+      profile_title, has_biblio_signal, logical(1)
+    )]
 
-cat("\nÁreas aceptadas desde corpus v5.2 + QA:\n")
-print(summary_profile_accepted_area)
+    matched_dt[, current_area_is_biblio := is_biblio_area_vec(get(area_col))]
 
-cat("\nÁreas sugeridas en perfil completo:\n")
-print(summary_profile_suggested_area)
+    # Buscar si hay área bibliométrica en top2..top5
+    top_area_cols <- intersect(
+      paste0("top", 2:5, "_area_name"),
+      names(matched_dt)
+    )
 
-cat("\nArchivos creados en:\n")
-cat(unmatched_out_dir, "\n")
+    if (length(top_area_cols) > 0) {
+      matched_dt[, biblio_in_top2_5 := Reduce("|", lapply(top_area_cols, function(col) {
+        is_biblio_area_vec(get(col))
+      }))]
+    } else {
+      matched_dt[, biblio_in_top2_5 := FALSE]
+    }
+
+    # Margen original
+    margin_col <- if ("top1_top2_margin" %in% names(matched_dt)) "top1_top2_margin" else NA_character_
+
+    if (!is.na(margin_col)) {
+      matched_dt[, margin_ok_for_rerank := get(margin_col) < rerank_margin_threshold | is.na(get(margin_col))]
+    } else {
+      matched_dt[, margin_ok_for_rerank := TRUE]
+    }
+
+    rerank_flag <- (
+      matched_dt$biblio_signal_in_title &
+      !matched_dt$current_area_is_biblio &
+      matched_dt$biblio_in_top2_5 &
+      matched_dt$margin_ok_for_rerank
+    )
+
+    n_matched_reranked <- sum(rerank_flag, na.rm = TRUE)
+    cat("Publicaciones matcheadas con señal bibliométrica en título:", sum(matched_dt$biblio_signal_in_title), "\n")
+    cat("Publicaciones matcheadas rerrankeadas a Bibliometrics:", n_matched_reranked, "\n")
+
+    if (n_matched_reranked > 0) {
+      # Identificar qué columna bibliométrica del top2-5 usar
+      matched_dt[, biblio_rerank_area := NA_character_]
+      for (col in top_area_cols) {
+        matched_dt[rerank_flag & is.na(biblio_rerank_area) & is_biblio_area_vec(get(col)),
+                   biblio_rerank_area := get(col)]
+      }
+
+      matched_dt[rerank_flag, orig_area_before_rerank := get(area_col)]
+      matched_dt[rerank_flag, (area_col) := biblio_rerank_area]
+
+      # Si existe qa_final_subarea_label, intentar actualizar
+      if ("top2_subarea_name" %in% names(matched_dt) && "qa_final_subarea_label" %in% names(matched_dt)) {
+        for (rank_i in 2:5) {
+          subarea_col <- paste0("top", rank_i, "_subarea_name")
+          area_col_i  <- paste0("top", rank_i, "_area_name")
+          if (subarea_col %in% names(matched_dt) && area_col_i %in% names(matched_dt)) {
+            matched_dt[
+              rerank_flag & is_biblio_area_vec(get(area_col_i)),
+              qa_final_subarea_label := get(subarea_col)
+            ]
+          }
+        }
+      }
+
+      matched_dt[rerank_flag, reranked_to_bibliometrics := TRUE]
+      matched_dt[!rerank_flag | is.na(rerank_flag), reranked_to_bibliometrics := FALSE]
+      matched_dt[rerank_flag, final_label_source := "corpus_match_reranked_biblio_signal"]
+
+      cat("\nPublicaciones matcheadas rerrankeadas:\n")
+      reranked_matched <- matched_dt[rerank_flag == TRUE,
+                                     .(profile_title, orig_area_before_rerank,
+                                       new_area = get(area_col))]
+      print(reranked_matched)
+    } else {
+      matched_dt[, reranked_to_bibliometrics := FALSE]
+    }
+
+    matched_reranked <- matched_dt
+    fwrite(matched_reranked,
+           file.path(profile_eval_dir, "profile_publications_matched_final_qa_v2_reranked.csv"))
+    cat("Archivo actualizado guardado:", file.path(profile_eval_dir, "profile_publications_matched_final_qa_v2_reranked.csv"), "\n")
+  }
+}
+
+# ── combinar y resumen general ────────────────────────────────
+
+cat("\n================ PERFIL COMPLETO COMBINADO ================\n")
+
+n_matched   <- if (nrow(matched_reranked) > 0) nrow(matched_reranked) else 0
+n_unmatched <- if (nrow(unmatched_classified) > 0) nrow(unmatched_classified) else 0
+n_total     <- n_matched + n_unmatched
+
+if (n_matched > 0 && "qa_final_area_label" %in% names(matched_reranked)) {
+  cat("\nPublicaciones MATCHEADAS (por área, post-reranking):\n")
+  matched_summary <- matched_reranked[
+    !is.na(qa_final_area_label) & qa_final_area_label != "",
+    .(publicaciones = .N, citas = sum(profile_cites, na.rm = TRUE)),
+    by = .(area = qa_final_area_label)
+  ][order(-publicaciones)]
+  matched_summary[, pct := round(publicaciones / sum(publicaciones) * 100, 1)]
+  print(matched_summary)
+}
+
+if (n_unmatched > 0 && "top1_area_name" %in% names(unmatched_classified)) {
+  cat("\nPublicaciones NO MATCHEADAS (por área, title-only + reranking):\n")
+  unmatched_summary <- unmatched_classified[
+    !is.na(top1_area_name),
+    .(publicaciones = .N, citas = sum(profile_cites, na.rm = TRUE)),
+    by = .(area = top1_area_name)
+  ][order(-publicaciones)]
+  unmatched_summary[, pct := round(publicaciones / sum(publicaciones) * 100, 1)]
+  print(unmatched_summary)
+}
+
+profile_coverage <- data.table(
+  metrica = c(
+    "publicaciones_matcheadas",
+    "publicaciones_titulo_solo_clasificadas",
+    "total_perfil_cubierto",
+    "pct_matcheadas",
+    "pct_titulo_solo"
+  ),
+  valor = c(
+    n_matched,
+    n_unmatched,
+    n_total,
+    if (n_total > 0) round(n_matched / n_total * 100, 2) else NA_real_,
+    if (n_total > 0) round(n_unmatched / n_total * 100, 2) else NA_real_
+  )
+)
+
+cat("\nCobertura total del perfil:\n")
+print(profile_coverage)
+
+fwrite(profile_coverage, file.path(unmatched_out_dir, "profile_coverage_summary.csv"))
+
+cat("\n\nNEXT STEP: Ejecuta 0054_combine_profile_embeddings.py con:\n")
+cat("  --unmatched_emb:", file.path(unmatched_out_dir, "unmatched_embeddings.npy"), "\n")
+cat("  --unmatched_meta:", file.path(unmatched_out_dir, "unmatched_embeddings_meta.csv"), "\n")
