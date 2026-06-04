@@ -477,3 +477,128 @@ summary_status_unmatched
 summary_metascience_unmatched
 summary_profile_accepted_area
 summary_profile_suggested_area
+
+
+# 3 ===============================================
+
+library(data.table)
+
+base_dir <- "/mnt/danny_nas/Doctorado-españa/Tesis-doctorado/analisis-VPN"
+tables_dir <- file.path(base_dir, "tables")
+researcher_safe_id <- "martin"
+
+unmatched_pred_file <- file.path(
+  tables_dir,
+  "objetivo1_v5_2_profile_unmatched_classified",
+  researcher_safe_id,
+  "unmatched_zero_shot_title_only_suggestions.csv"
+)
+
+matched_reranked_file <- file.path(
+  tables_dir,
+  "objetivo1_v5_2_profile_individual_evaluation_fast",
+  researcher_safe_id,
+  "profile_publications_matched_final_qa_v2_reranked.csv"
+)
+
+pred <- fread(unmatched_pred_file)
+matched <- fread(matched_reranked_file)
+
+clean_text <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("[[:space:]]+", " ", x)
+  trimws(x)
+}
+
+pred[, profile_cites := suppressWarnings(as.numeric(profile_cites))]
+matched[, profile_cites := suppressWarnings(as.numeric(profile_cites))]
+
+# No emparejadas: sugerencia title-only post-reranking
+pred[, profile_classification_origin := "profile_unmatched_title_only_suggestion"]
+pred[, profile_output_type := "review_required_title_only_suggestion"]
+pred[, profile_suggested_area_label := clean_text(top1_area_name)]
+pred[, profile_suggested_subarea_label := clean_text(top1_subarea_name)]
+pred[, profile_accepted_area_label := NA_character_]
+pred[, profile_accepted_subarea_label := NA_character_]
+pred[, profile_requires_review := TRUE]
+
+# Emparejadas: corpus v5.2 + QA
+matched[, profile_classification_origin := "matched_in_universe_v5_2_qa"]
+matched[, profile_output_type := fifelse(
+  qa_auto_accept == TRUE,
+  "accepted_from_corpus_qa",
+  "review_required_from_corpus_qa"
+)]
+
+matched[, profile_suggested_area_label := clean_text(top1_area_name)]
+matched[, profile_suggested_subarea_label := clean_text(top1_subarea_name)]
+
+matched[, profile_accepted_area_label := fifelse(
+  qa_auto_accept == TRUE,
+  qa_final_area_label,
+  NA_character_
+)]
+
+matched[, profile_accepted_subarea_label := fifelse(
+  qa_auto_accept == TRUE,
+  qa_final_subarea_label,
+  NA_character_
+)]
+
+matched[, profile_requires_review := qa_requires_review]
+
+common_cols <- c(
+  "profile_row_id",
+  "profile_title",
+  "profile_year",
+  "profile_cites",
+  "profile_classification_origin",
+  "profile_output_type",
+  "profile_suggested_area_label",
+  "profile_suggested_subarea_label",
+  "profile_accepted_area_label",
+  "profile_accepted_subarea_label",
+  "profile_requires_review",
+  "top1_score",
+  "top1_top2_margin",
+  "reranked_to_bibliometrics",
+  "rerank_reason"
+)
+
+for (col in common_cols) {
+  if (!col %in% names(pred)) pred[, (col) := NA]
+  if (!col %in% names(matched)) matched[, (col) := NA]
+}
+
+profile_combined_reranked <- rbindlist(
+  list(
+    matched[, ..common_cols],
+    pred[, ..common_cols]
+  ),
+  fill = TRUE
+)
+
+summary_profile_suggested_area_reranked <- profile_combined_reranked[
+  ,
+  .(
+    publications = .N,
+    citations = sum(profile_cites, na.rm = TRUE),
+    accepted = sum(!is.na(profile_accepted_area_label) & profile_accepted_area_label != "", na.rm = TRUE),
+    review_required = sum(profile_requires_review == TRUE, na.rm = TRUE),
+    reranked_cases = sum(reranked_to_bibliometrics == TRUE, na.rm = TRUE)
+  ),
+  by = .(
+    profile_suggested_area_label,
+    profile_suggested_subarea_label
+  )
+][order(-publications)]
+
+summary_profile_suggested_area_reranked[
+  ,
+  pct := round(publications / sum(publications) * 100, 2)
+]
+
+summary_profile_suggested_area_reranked
+
